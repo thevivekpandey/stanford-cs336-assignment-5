@@ -30,9 +30,21 @@ def tokenize_prompt_and_output(
         "labels": padded[:, 1:], 
         "response_mask": is_response[:, 1:]}
 
-def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+def compute_entropy_old(logits: torch.Tensor) -> torch.Tensor:
     log_probs = torch.log_softmax(logits, dim=-1)
     return -(log_probs * log_probs.exp()).sum(dim=-1)
+
+def compute_entropy(logits: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
+    # Same result as compute_entropy_old, chunked over the sequence dimension.
+    # log_softmax reduces over the vocab dimension only, so each position is
+    # computed exactly as it would be in one shot, but we never hold more than
+    # `chunk_size` positions worth of vocab-sized intermediates at once. With a
+    # ~100k vocab those intermediates are what blow up GPU memory.
+    entropies = []
+    for start in range(0, logits.shape[-2], chunk_size):
+        chunk_log_probs = torch.log_softmax(logits[..., start:start + chunk_size, :], dim=-1)
+        entropies.append(-(chunk_log_probs * chunk_log_probs.exp()).sum(dim=-1))
+    return torch.cat(entropies, dim=-1)
 
 def get_response_log_probs(
     model: PreTrainedModel,
@@ -46,7 +58,10 @@ def get_response_log_probs(
     out_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     out = {"log_probs": out_probs}
     if return_token_entropy:
-        out["token_entropy"] = compute_entropy(logits)
+        # Entropy is only logged as a metric, never backpropagated through, so
+        # keeping it out of the autograd graph saves a vocab-sized tensor.
+        with torch.no_grad():
+            out["token_entropy"] = compute_entropy(logits)
     return out
 
 def compute_rollout_rewards(
@@ -188,6 +203,9 @@ def grpo_train_step(
     advantages, _ = compute_group_normalized_rewards(
         raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer
     )
+    # Rewards are computed on CPU from the rollout strings; the loss needs them
+    # on the same device as the model's log probs.
+    advantages = advantages.to(device)
 
     # Split into microbatches for gradient accumulation
     batch_size = len(input_ids)

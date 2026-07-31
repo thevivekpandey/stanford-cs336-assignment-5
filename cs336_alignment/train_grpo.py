@@ -4,6 +4,7 @@ Uses two-GPU setup: one for vLLM rollout generation, one for training.
 All hyperparameters are hardcoded as specified in the assignment.
 """
 
+import argparse
 import json
 import torch
 import wandb
@@ -18,20 +19,20 @@ from checkpoint import get_model_and_tokenizer
 from drgrpo_grader import r1_zero_reward_fn
 
 # Hardcoded configuration
-RANDOM_SEED = 42
+RANDOM_SEED = 45
 MODEL_NAME = "allenai/OLMo-2-0425-1B"
 DATASET_PATH = "../data/gsm8k"
-PROMPT_PATH = "../prompts/r1_zero.prompt"
+PROMPT_PATH = "prompts/r1_zero.prompt"
 
 # Training hyperparameters
 N_TRAIN_EXAMPLES = 6400
 N_VAL_EXAMPLES = 1024
-NUM_ROLLOUT_STEPS = 200
-LEARNING_RATE = 1e-5
+NUM_ROLLOUT_STEPS = 250  # override with --num-rollout-steps
+LEARNING_RATE = 1e-5  # default; override with --lr (see sweep_lr.sh)
 ROLLOUT_BATCH_SIZE = 256
 TRAIN_BATCH_SIZE = 256
 GROUP_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 32
+GRADIENT_ACCUMULATION_STEPS = 256  # microbatch of 1 seq; 8 OOMs on a 23GB L4
 SAMPLING_TEMPERATURE = 1.0
 SAMPLING_MAX_TOKENS = 512
 MAX_GRAD_NORM = 1.0
@@ -44,6 +45,8 @@ LOSS_NORMALIZATION = "sequence"
 # Logging
 EVAL_EVERY = 10
 LOG_ROLLOUTS_EVERY = 40
+SAVE_EVERY = 100
+CHECKPOINT_DIR = "checkpoints/grpo"
 
 # GPU assignment
 TRAINING_GPU = 0  # GPU for training model
@@ -51,7 +54,47 @@ VLLM_GPU = 1      # GPU for vLLM rollout generation
 
 # WandB config
 WANDB_PROJECT = "cs336-grpo"
-WANDB_RUN_NAME = f"grpo_seed_{RANDOM_SEED}"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="GRPO training on GSM8K.")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=LEARNING_RATE,
+        help="AdamW learning rate.",
+    )
+    parser.add_argument(
+        "--num-rollout-steps",
+        type=int,
+        default=NUM_ROLLOUT_STEPS,
+        help="Number of rollout/train steps.",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="WandB run name. Defaults to grpo_lr=<lr>.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Checkpoint directory. Defaults to <CHECKPOINT_DIR>/lr_<lr>.",
+    )
+    args = parser.parse_args()
+    if args.run_name is None:
+        args.run_name = f"grpo_lr={args.lr:g}"
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = str(Path(CHECKPOINT_DIR) / f"lr_{args.lr:g}")
+    return args
+
+
+def extract_gsm8k_answer(answer: str) -> str:
+    """Extract the final answer from a GSM8K worked solution."""
+    if "####" not in answer:
+        raise ValueError(f"Malformed GSM8K answer: {answer!r}")
+    return answer.rsplit("####", 1)[1].strip().replace(",", "")
 
 
 def load_dataset(split: str) -> list[dict]:
@@ -60,7 +103,9 @@ def load_dataset(split: str) -> list[dict]:
     data = []
     with open(file_path, 'r') as f:
         for line in f:
-            data.append(json.loads(line))
+            item = json.loads(line)
+            item["answer"] = extract_gsm8k_answer(item["answer"])
+            data.append(item)
     return data
 
 
@@ -72,7 +117,7 @@ def load_prompt_template() -> str:
 
 def format_prompt(question: str, template: str) -> str:
     """Format a question with the prompt template."""
-    return template.replace("{{QUESTION}}", question)
+    return template.replace("{question}", question)
 
 
 def sync_weights_to_vllm(training_model, vllm_engine, temp_dir):
@@ -80,26 +125,14 @@ def sync_weights_to_vllm(training_model, vllm_engine, temp_dir):
     Sync weights from training model to vLLM engine.
 
     Strategy: Save the training model's weights to a temporary checkpoint,
-    then reload the vLLM engine with the updated weights.
+    then have each vLLM worker reload its weights from that checkpoint.
 
-    Note: vLLM doesn't support direct weight updates, so we use
-    the model's state_dict to update the underlying vLLM model.
+    The vLLM engine runs in its own process (and on a different GPU), so the
+    training model's tensors can't be handed to it directly. `reload_weights`
+    only needs the checkpoint path, which crosses the process boundary cheaply.
     """
-    # Get the vLLM model's underlying worker model
-    # This accesses vLLM's internal model structure
-    vllm_model = vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-
-    # Copy state dict from training model to vLLM model
-    training_state = training_model.state_dict()
-
-    # Transfer to CPU first to avoid device conflicts, then to vLLM's device
-    vllm_state = {k: v.cpu() for k, v in training_state.items()}
-
-    # Load into vLLM model
-    vllm_model.load_state_dict(vllm_state)
-
-    # Move back to vLLM's GPU
-    vllm_model = vllm_model.cuda()
+    training_model.save_pretrained(temp_dir, safe_serialization=True)
+    vllm_engine.collective_rpc("reload_weights", kwargs={"weights_path": temp_dir})
 
 
 def generate_rollouts(
@@ -166,6 +199,11 @@ def evaluate(
 
 
 def main():
+    args = parse_args()
+    learning_rate = args.lr
+    num_rollout_steps = args.num_rollout_steps
+    checkpoint_dir = args.checkpoint_dir
+
     # Set random seed
     torch.manual_seed(RANDOM_SEED)
 
@@ -175,14 +213,14 @@ def main():
     # Initialize wandb
     wandb.init(
         project=WANDB_PROJECT,
-        name=WANDB_RUN_NAME,
+        name=args.run_name,
         config={
             "random_seed": RANDOM_SEED,
             "model_name": MODEL_NAME,
             "n_train_examples": N_TRAIN_EXAMPLES,
             "n_val_examples": N_VAL_EXAMPLES,
-            "num_rollout_steps": NUM_ROLLOUT_STEPS,
-            "learning_rate": LEARNING_RATE,
+            "num_rollout_steps": num_rollout_steps,
+            "learning_rate": learning_rate,
             "rollout_batch_size": ROLLOUT_BATCH_SIZE,
             "train_batch_size": TRAIN_BATCH_SIZE,
             "group_size": GROUP_SIZE,
@@ -193,6 +231,8 @@ def main():
             "baseline": BASELINE,
             "advantage_normalizer": ADVANTAGE_NORMALIZER,
             "loss_normalization": LOSS_NORMALIZATION,
+            "save_every": SAVE_EVERY,
+            "checkpoint_dir": checkpoint_dir,
             "training_gpu": TRAINING_GPU,
             "vllm_gpu": VLLM_GPU,
         }
@@ -207,14 +247,15 @@ def main():
 
     # Initialize training model on GPU 0
     print(f"Loading training model on GPU {TRAINING_GPU}...")
-    model, tokenizer = get_model_and_tokenizer(MODEL_NAME)
+    model, tokenizer = get_model_and_tokenizer(MODEL_NAME, device=f"cuda:{TRAINING_GPU}")
     device = torch.device(f"cuda:{TRAINING_GPU}")
     model = model.to(device)
+    model.config.use_cache = False  # no KV cache needed for training forwards
 
     # Initialize optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LEARNING_RATE,
+        lr=learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.0,
     )
@@ -234,7 +275,8 @@ def main():
     print("Starting training...")
     global_step = 0
 
-    for step in tqdm(range(NUM_ROLLOUT_STEPS), desc="Training"):
+    for step in range(num_rollout_steps):
+        print(f"STEP: {step}")
         # Sample a batch of training examples
         batch_indices = torch.randint(0, len(train_data), (ROLLOUT_BATCH_SIZE // GROUP_SIZE,)).tolist()
         batch_data = [train_data[i] for i in batch_indices]
@@ -282,6 +324,15 @@ def main():
             **metadata,
         })
 
+        # Save a persistent checkpoint after every SAVE_EVERY completed steps.
+        completed_steps = step + 1
+        if completed_steps % SAVE_EVERY == 0:
+            checkpoint_path = Path(checkpoint_dir) / f"step_{completed_steps}"
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(checkpoint_path, safe_serialization=True)
+            tokenizer.save_pretrained(checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+
         # Log rollouts periodically
         if step % LOG_ROLLOUTS_EVERY == 0:
             rollout_table = wandb.Table(
@@ -326,7 +377,7 @@ def main():
         SAMPLING_MAX_TOKENS,
     )
     wandb.log({
-        "step": NUM_ROLLOUT_STEPS,
+        "step": num_rollout_steps,
         **{"final_" + k: v for k, v in final_metrics.items()}
     })
     print(f"Final validation reward: {final_metrics['val_reward']:.4f}")
