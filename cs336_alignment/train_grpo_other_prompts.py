@@ -9,9 +9,16 @@ training). The learning rate is fixed here; the sweep axis is the random seed
 
 import argparse
 import json
+import os
+
+# vLLM 0.26 defaults to torch's AOT compile path on torch >= 2.10, which trips a
+# dynamo source-consistency assertion for OLMo-2 (served via the Transformers
+# backend). Fall back to the regular torch.compile path. Must be set before vllm
+# is imported.
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+
 import torch
 import wandb
-import os
 import tempfile
 from pathlib import Path
 from tqdm import tqdm
