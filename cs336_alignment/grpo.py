@@ -176,12 +176,6 @@ def grpo_train_step(
     # Only support standard on-policy GRPO for now
     if importance_reweighting_method != "none":
         raise NotImplementedError("Only on-policy GRPO is supported")
-    if baseline != "mean":
-        raise NotImplementedError("Only baseline='mean' is supported")
-    if advantage_normalizer != "std":
-        raise NotImplementedError("Only advantage_normalizer='std' is supported")
-    if loss_normalization != "sequence":
-        raise NotImplementedError("Only loss_normalization='sequence' is supported")
 
     # Tokenize prompts and outputs
     tokenized = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
@@ -252,13 +246,20 @@ def grpo_train_step(
         )
 
         # Scale loss for gradient accumulation (so the gradient is averaged correctly)
-        scaled_loss = loss * (len(mb_input_ids) / batch_size)
+        # For constant normalization, don't scale since the constant applies to whole batch
+        if loss_normalization == "sequence":
+            scaled_loss = loss * (len(mb_input_ids) / batch_size)
+        else:
+            scaled_loss = loss
 
         # Backward pass
         scaled_loss.backward()
 
         # Track metrics
-        total_loss += loss.item() * (len(mb_input_ids) / batch_size)
+        if loss_normalization == "sequence":
+            total_loss += loss.item() * (len(mb_input_ids) / batch_size)
+        else:
+            total_loss += loss.item()
         all_entropy.append(mb_entropy[mb_response_mask].detach())
 
     # Clip gradients

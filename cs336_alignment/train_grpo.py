@@ -40,7 +40,8 @@ MAX_GRAD_NORM = 1.0
 # GRPO settings
 BASELINE = "mean"
 ADVANTAGE_NORMALIZER = "std"
-LOSS_NORMALIZATION = "sequence"
+LOSS_NORMALIZATION = "constant"
+NORMALIZATION_CONSTANT = 32
 
 # Logging
 EVAL_EVERY = 10
@@ -316,6 +317,7 @@ def main():
             advantage_eps=1e-6,
             advantage_normalizer=ADVANTAGE_NORMALIZER,
             loss_normalization=LOSS_NORMALIZATION,
+            normalization_constant=NORMALIZATION_CONSTANT,
         )
 
         # Log training metrics
