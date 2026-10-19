@@ -19,7 +19,7 @@ from checkpoint import get_model_and_tokenizer
 from drgrpo_grader import r1_zero_reward_fn
 
 # Hardcoded configuration
-RANDOM_SEED = 45
+RANDOM_SEED = 45  # default; override with --seed (see sweep_seeds.sh)
 MODEL_NAME = "allenai/OLMo-2-0425-1B"
 DATASET_PATH = "../data/gsm8k"
 PROMPT_PATH = "prompts/r1_zero.prompt"
@@ -27,8 +27,8 @@ PROMPT_PATH = "prompts/r1_zero.prompt"
 # Training hyperparameters
 N_TRAIN_EXAMPLES = 6400
 N_VAL_EXAMPLES = 1024
-NUM_ROLLOUT_STEPS = 250  # override with --num-rollout-steps
-LEARNING_RATE = 1e-5  # default; override with --lr (see sweep_lr.sh)
+NUM_ROLLOUT_STEPS = 200  # override with --num-rollout-steps
+LEARNING_RATE = 1e-5  # tuned on standard GRPO via sweep_lr.sh; held fixed for the variants
 ROLLOUT_BATCH_SIZE = 256
 TRAIN_BATCH_SIZE = 256
 GROUP_SIZE = 8
@@ -37,11 +37,24 @@ SAMPLING_TEMPERATURE = 1.0
 SAMPLING_MAX_TOKENS = 512
 MAX_GRAD_NORM = 1.0
 
-# GRPO settings
+# GRPO settings.
+# Per assignment 5.4, this combination is the MaxRL variant: Dr_GRPO's baseline
+# but dividing by the group mean instead of the group std, so the advantage is
+# (r - mu) / mu. Groups the model already solves reliably (mu near 1) get scaled
+# down, while groups it barely solves (mu small) get scaled way up -- an
+# aggressive difficulty reweighting toward the hardest questions it can still
+# occasionally answer. The advantage_eps in compute_group_normalized_rewards is
+# what keeps an all-wrong group (mu = 0) from producing 0/0 = NaN. VARIANT just
+# labels it in run names and checkpoint paths so these runs don't collide with
+# the completed grpo_constant, dr_grpo and rft runs.
 BASELINE = "mean"
-ADVANTAGE_NORMALIZER = "std"
+ADVANTAGE_NORMALIZER = "mean"
 LOSS_NORMALIZATION = "constant"
-NORMALIZATION_CONSTANT = 32
+# = ROLLOUT_BATCH_SIZE. The loss sums over tokens and over all sequences in the
+# batch, so dividing by n_prompts * GROUP_SIZE reproduces the assignment's
+# estimator E_x[(1/G) sum_j A_j grad log pi(y_j|x)] with Z = G.
+NORMALIZATION_CONSTANT = 256
+VARIANT = "maxrl"
 
 # Logging
 EVAL_EVERY = 10
@@ -66,6 +79,13 @@ def parse_args():
         help="AdamW learning rate.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_SEED,
+        help="Random seed. Seeds torch (batch sampling) and the vLLM engine "
+             "(rollout sampling).",
+    )
+    parser.add_argument(
         "--num-rollout-steps",
         type=int,
         default=NUM_ROLLOUT_STEPS,
@@ -75,19 +95,26 @@ def parse_args():
         "--run-name",
         type=str,
         default=None,
-        help="WandB run name. Defaults to grpo_lr=<lr>.",
+        help="WandB run name. Defaults to <VARIANT>_lr=<lr>_seed=<seed>.",
     )
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
         default=None,
-        help="Checkpoint directory. Defaults to <CHECKPOINT_DIR>/lr_<lr>.",
+        help="Checkpoint directory. Defaults to "
+             "<CHECKPOINT_DIR>/<VARIANT>/lr_<lr>_seed_<seed>.",
     )
     args = parser.parse_args()
+    # Key both on variant, lr AND seed: a seed sweep holds lr fixed, so keying
+    # on lr alone would give every seed the same run name and have each seed
+    # overwrite the previous one's checkpoints.
+    tag = f"lr={args.lr:g}_seed={args.seed}"
     if args.run_name is None:
-        args.run_name = f"grpo_lr={args.lr:g}"
+        args.run_name = f"{VARIANT}_{tag}"
     if args.checkpoint_dir is None:
-        args.checkpoint_dir = str(Path(CHECKPOINT_DIR) / f"lr_{args.lr:g}")
+        args.checkpoint_dir = str(
+            Path(CHECKPOINT_DIR) / VARIANT / tag.replace("=", "_")
+        )
     return args
 
 
@@ -201,12 +228,13 @@ def evaluate(
 
 def main():
     args = parse_args()
+    seed = args.seed
     learning_rate = args.lr
     num_rollout_steps = args.num_rollout_steps
     checkpoint_dir = args.checkpoint_dir
 
-    # Set random seed
-    torch.manual_seed(RANDOM_SEED)
+    # Seed torch: controls which training examples each step samples.
+    torch.manual_seed(seed)
 
     # Create temp directory for weight syncing
     temp_dir = tempfile.mkdtemp()
@@ -216,8 +244,10 @@ def main():
         project=WANDB_PROJECT,
         name=args.run_name,
         config={
-            "random_seed": RANDOM_SEED,
+            "random_seed": seed,
+            "variant": VARIANT,
             "model_name": MODEL_NAME,
+            "prompt_path": PROMPT_PATH,
             "n_train_examples": N_TRAIN_EXAMPLES,
             "n_val_examples": N_VAL_EXAMPLES,
             "num_rollout_steps": num_rollout_steps,
@@ -232,6 +262,7 @@ def main():
             "baseline": BASELINE,
             "advantage_normalizer": ADVANTAGE_NORMALIZER,
             "loss_normalization": LOSS_NORMALIZATION,
+            "normalization_constant": NORMALIZATION_CONSTANT,
             "save_every": SAVE_EVERY,
             "checkpoint_dir": checkpoint_dir,
             "training_gpu": TRAINING_GPU,
@@ -264,10 +295,14 @@ def main():
     # Initialize vLLM engine on GPU 1
     print(f"Initializing vLLM engine on GPU {VLLM_GPU}...")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(VLLM_GPU)
+    # Seed at the engine level, not per-request: a per-request seed in
+    # SamplingParams would make all group_size rollouts of the same prompt
+    # identical, collapsing the GRPO advantages to zero.
     vllm_engine = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.9,
+        seed=seed,
     )
     # Reset CUDA_VISIBLE_DEVICES to allow training on GPU 0
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{TRAINING_GPU},{VLLM_GPU}"

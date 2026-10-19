@@ -99,7 +99,9 @@ def compute_group_normalized_rewards(
     if advantage_normalizer == "std":
         advantages = group_wise_rewards / (std_rewards + torch.tensor(advantage_eps))
     elif advantage_normalizer == "mean":
-        advantages = group_wise_rewards / mean_rewards
+        # advantage_eps guards against a group that scored all zeros, where the
+        # mean is 0 and the unguarded division would be 0/0 -> NaN.
+        advantages = group_wise_rewards / (mean_rewards + torch.tensor(advantage_eps))
     else:
         advantages = group_wise_rewards
     return advantages.flatten(), {}
@@ -201,9 +203,37 @@ def grpo_train_step(
     # on the same device as the model's log probs.
     advantages = advantages.to(device)
 
-    # Split into microbatches for gradient accumulation
+    # Split into microbatches for gradient accumulation.
+    # batch_size is read BEFORE pruning below: it is the divisor for sequence
+    # normalization, and pruning must not change it.
     batch_size = len(input_ids)
-    microbatch_size = batch_size // gradient_accumulation_steps
+    microbatch_size = max(1, batch_size // gradient_accumulation_steps)
+
+    # Skip zero-advantage sequences (assignment 5.4). Their per-token loss is
+    # -A * log_probs, which is exactly 0 at every token when A == 0, so they add
+    # nothing to the gradient and never need to be passed through the model.
+    # This fires often: with baseline="mean" every group whose rollouts all earn
+    # the same reward drops out, and with baseline="none" every wrong answer does.
+    #
+    # The gradient is unchanged because the aggregation below still divides by
+    # the original batch_size / normalization_constant, not by the kept count.
+    keep = torch.nonzero(advantages != 0, as_tuple=True)[0]
+    n_kept = keep.numel()
+    if n_kept == 0:
+        # No learning signal at all this step. Keep one sequence anyway: its
+        # loss is 0, so the gradient is 0 either way, but this way the optimizer
+        # step below still runs exactly as it did without pruning. (AdamW on a
+        # zero gradient is not a no-op -- it still applies its decayed momentum.)
+        keep = keep.new_zeros(1)
+
+    input_ids = input_ids[keep]
+    labels = labels[keep]
+    response_mask = response_mask[keep]
+    advantages = advantages[keep]
+
+    # Hold microbatch_size fixed and take fewer accumulation steps instead,
+    # rounding up so a partial final microbatch still runs.
+    n_microbatches = (len(input_ids) + microbatch_size - 1) // microbatch_size
 
     # Initialize metrics
     total_loss = 0.0
@@ -211,7 +241,7 @@ def grpo_train_step(
 
     optimizer.zero_grad()
 
-    for i in range(gradient_accumulation_steps):
+    for i in range(n_microbatches):
         start_idx = i * microbatch_size
         end_idx = start_idx + microbatch_size
 
@@ -278,6 +308,9 @@ def grpo_train_step(
         "loss": total_loss,
         "train_reward": reward_metadata["mean_total"],
         "train_format_reward": reward_metadata["mean_format"],
+        # Share of the batch that was skipped as zero-advantage. Expected to be
+        # large for RFT, where every incorrect rollout has zero advantage.
+        "frac_pruned": 1.0 - n_kept / batch_size,
     }
 
     if grad_norm is not None:
